@@ -715,6 +715,9 @@ def main():
     - This creates an overlapping pipeline for maximum efficiency
     - Uses both sync and async approaches for maximum performance
     """
+    # Process vendors with a maximum of 10 concurrent operations (data processing + downloads)
+    max_concurrent_vendors = 10
+    
     print(f"Starting processing for {len(vendors)} vendors with {max_concurrent_vendors} concurrent operations", flush=True)
     print("Downloads will start IMMEDIATELY as each vendor's data processing completes", flush=True)
     print("Using optimized threading + async downloads + compression + progress tracking", flush=True)
@@ -723,9 +726,6 @@ def main():
     # Start progress monitoring thread
     progress_thread = threading.Thread(target=progress_monitor, daemon=True)
     progress_thread.start()
-    
-    # Process vendors with a maximum of 10 concurrent operations (data processing + downloads)
-    max_concurrent_vendors = 10
     completed_data_processing = 0
     started_downloads = 0
     
