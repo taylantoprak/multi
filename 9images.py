@@ -512,8 +512,13 @@ async def async_download_file(session, url, folder, file_name, sequence, quality
                 else:
                     file_extension = 'jpg'
 
-                full_file_name = f"{file_name}.{file_extension}"
+                # Sanitize the file name to avoid path issues
+                sanitized_file_name = sanitize_filename(file_name)
+                full_file_name = f"{sanitized_file_name}_{sequence:02d}.{file_extension}"
                 file_path = os.path.join(folder, full_file_name)
+                
+                # Ensure the directory exists
+                os.makedirs(folder, exist_ok=True)
 
                 # Download and save
                 async with aiofiles.open(file_path, 'wb') as f:
@@ -596,6 +601,30 @@ class DownloadQueue:
                 logging.error(f"Worker error: {e}")
                 break
 
+def sanitize_filename(filename):
+    """Sanitize filename to remove invalid characters"""
+    # Remove or replace invalid characters for file paths
+    invalid_chars = '<>:"/\\|?*{}[]()'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    
+    # Remove multiple consecutive underscores
+    while '__' in filename:
+        filename = filename.replace('__', '_')
+    
+    # Remove leading/trailing underscores and dots
+    filename = filename.strip('_.')
+    
+    # Ensure filename is not empty
+    if not filename:
+        filename = 'unnamed'
+    
+    # Limit length to avoid filesystem issues
+    if len(filename) > 200:
+        filename = filename[:200]
+    
+    return filename
+
 def download_file(url, folder, file_name, sequence, retries=3, delay=2):
     """Download a file with optimized retry logic, connection pooling, and compression."""
     global download_session
@@ -623,9 +652,13 @@ def download_file(url, folder, file_name, sequence, retries=3, delay=2):
                 else:
                     file_extension = 'jpg'  # Default fallback
 
-                # Use the provided file_name with extension
-                full_file_name = f"{file_name}.{file_extension}"
+                # Sanitize the file name to avoid path issues
+                sanitized_file_name = sanitize_filename(file_name)
+                full_file_name = f"{sanitized_file_name}_{sequence:02d}.{file_extension}"
                 file_path = os.path.join(folder, full_file_name)
+                
+                # Ensure the directory exists
+                os.makedirs(folder, exist_ok=True)
 
                 # Optimized file writing with larger chunks
                 with open(file_path, 'wb') as file:
@@ -686,9 +719,10 @@ def process_download(row, vendor, base_directory, failed_downloads):
             img_futures = []
             
             for sequence, img_url in enumerate(image_urls, 1):
-                # Use Tag Name as prefix for file naming
-                file_prefix = tag_name.replace(' ', '_').replace(',', '_')
-                file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+                # Use Tag Name as prefix for file naming with better sanitization
+                file_prefix = sanitize_filename(tag_name)
+                good_id_clean = sanitize_filename(good_id)
+                file_name = f"{file_prefix}_{good_id_clean}"
                 
                 # Submit download task
                 future = img_executor.submit(download_file, img_url, folder_path, file_name, sequence)
