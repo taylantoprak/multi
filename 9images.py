@@ -766,6 +766,7 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_vendors) as executor:
         # Submit all vendor processing tasks
         future_to_vendor = {}
+        download_futures = []
         
         for vendor in vendors:
             # First, process data for the vendor
@@ -792,6 +793,7 @@ def main():
                         # Start sync download process
                         download_future = executor.submit(process_vendor_downloads, vendor, qualified_df, os.getcwd())
                     
+                    download_futures.append(download_future)
                     started_downloads += 1
                     print(f"Vendor {vendor} - Data processing completed ({completed_data_processing}/{len(vendors)}), downloads started immediately", flush=True)
                     logging.info(f"Vendor {vendor} - Data processing completed, downloads started immediately")
@@ -801,9 +803,17 @@ def main():
             except Exception as e:
                 print(f"Vendor {vendor} - Error processing data: {e} ({completed_data_processing}/{len(vendors)})", flush=True)
                 logging.error(f"Vendor {vendor} - Error processing data: {e}")
+        
+        # Wait for all download futures to complete
+        print(f"Waiting for {len(download_futures)} download processes to complete...", flush=True)
+        for download_future in concurrent.futures.as_completed(download_futures):
+            try:
+                download_future.result()
+            except Exception as e:
+                logging.error(f"Download process error: {e}")
     
     print(f"All vendor processing completed. Started downloads for {started_downloads} vendors.", flush=True)
-    print("Note: Downloads run concurrently and may still be in progress.", flush=True)
+    print("All downloads have been completed.", flush=True)
     print("Progress monitoring will continue until all downloads complete.", flush=True)
     logging.info(f"All vendor processing completed. Started downloads for {started_downloads} vendors.")
     
