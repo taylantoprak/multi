@@ -406,12 +406,20 @@ def process_download(row, vendor, base_directory, failed_downloads):
 failed_downloads = []
 
 def main():
-    """Main function to process all vendors concurrently with immediate downloads."""
-    print(f"Starting processing for {len(vendors)} vendors", flush=True)
-    logging.info(f"Starting processing for {len(vendors)} vendors")
+    """Main function to process all vendors concurrently with immediate downloads.
     
-    # Process vendors with a maximum of 5 concurrent operations (data processing + downloads)
-    max_concurrent_vendors = 5
+    Download Behavior:
+    - Downloads start IMMEDIATELY as each vendor's data processing completes
+    - No waiting for all vendors to finish before starting downloads
+    - Up to 10 vendors can process data + download images simultaneously
+    - This creates an overlapping pipeline for maximum efficiency
+    """
+    print(f"Starting processing for {len(vendors)} vendors with {max_concurrent_vendors} concurrent operations", flush=True)
+    print("Downloads will start IMMEDIATELY as each vendor's data processing completes", flush=True)
+    logging.info(f"Starting processing for {len(vendors)} vendors with {max_concurrent_vendors} concurrent operations")
+    
+    # Process vendors with a maximum of 10 concurrent operations (data processing + downloads)
+    max_concurrent_vendors = 10
     completed_data_processing = 0
     started_downloads = 0
     
@@ -446,6 +454,7 @@ def main():
                 logging.error(f"Vendor {vendor} - Error processing data: {e}")
     
     print(f"All vendor processing completed. Started downloads for {started_downloads} vendors.", flush=True)
+    print("Note: Downloads run concurrently and may still be in progress.", flush=True)
     logging.info(f"All vendor processing completed. Started downloads for {started_downloads} vendors.")
 
 # Run the main process
