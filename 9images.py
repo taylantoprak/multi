@@ -8,6 +8,10 @@ import sys
 import time
 import re
 import random
+import shutil
+import asyncio
+import aiohttp
+import aiofiles
 
 # Array of vendors to process
 vendors = [
@@ -77,14 +81,64 @@ vendors = [
 ]
 
 
-# Set up logging
-log_filename = "luxurylog.log"
-logging.basicConfig(
-    filename=log_filename, 
-    filemode='w',  # Overwrites the log file each time the script runs
-    level=logging.INFO, 
-    format="%(asctime)s:%(levelname)s:%(message)s"
-)
+# Set up logging with fallback to console if disk space issues
+def setup_logging():
+    log_filename = "luxurylog.log"
+    try:
+        logging.basicConfig(
+            filename=log_filename, 
+            filemode='w',  # Overwrites the log file each time the script runs
+            level=logging.INFO, 
+            format="%(asctime)s:%(levelname)s:%(message)s"
+        )
+    except OSError as e:
+        if e.errno == 28:  # No space left on device
+            print(f"Warning: Cannot create log file due to disk space. Logging to console only.")
+            logging.basicConfig(
+                level=logging.INFO, 
+                format="%(asctime)s:%(levelname)s:%(message)s"
+            )
+        else:
+            raise
+
+setup_logging()
+
+def check_disk_space(path, required_bytes=100*1024*1024):  # 100MB minimum
+    """Check if there's enough disk space available."""
+    try:
+        statvfs = os.statvfs(path)
+        free_bytes = statvfs.f_frsize * statvfs.f_bavail
+        return free_bytes >= required_bytes, free_bytes
+    except (OSError, AttributeError):
+        # Fallback for Windows or if statvfs fails
+        try:
+            free_bytes = shutil.disk_usage(path).free
+            return free_bytes >= required_bytes, free_bytes
+        except OSError:
+            return False, 0
+
+def format_bytes(bytes_value):
+    """Format bytes into human readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.1f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.1f} PB"
+
+def safe_log(message, level=logging.INFO):
+    """Safely log a message, handling disk space errors."""
+    try:
+        if level == logging.INFO:
+            logging.info(message)
+        elif level == logging.WARNING:
+            logging.warning(message)
+        elif level == logging.ERROR:
+            logging.error(message)
+    except OSError as e:
+        if e.errno == 28:  # No space left on device
+            print(f"LOG ERROR (disk full): {message}")
+        else:
+            raise
 
 logging.info("Script started")
 
@@ -317,6 +371,95 @@ imgheaders = {
     'sec-ch-ua-platform': '"Windows"',
 }
 
+async def async_download_file(session, url, folder, file_name, sequence, retries=4, delay=15):
+    """Async download a file with retry logic and disk space checking."""
+    attempt = 0
+    
+    while attempt < retries:
+        try:
+            # Check disk space before attempting download
+            has_space, free_bytes = check_disk_space(folder, 50*1024*1024)  # 50MB minimum
+            if not has_space:
+                error_msg = f"Insufficient disk space. Available: {format_bytes(free_bytes)}"
+                safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                return False, error_msg
+            
+            async with session.get(url, headers=imgheaders, timeout=30) as response:
+                if response.status == 200:
+                    # Get content length for additional space check
+                    content_length = response.headers.get('Content-Length')
+                    if content_length:
+                        file_size = int(content_length)
+                        has_space, free_bytes = check_disk_space(folder, file_size + 10*1024*1024)  # 10MB buffer
+                        if not has_space:
+                            error_msg = f"Insufficient disk space for file. Required: {format_bytes(file_size)}, Available: {format_bytes(free_bytes)}"
+                            safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                            return False, error_msg
+                    
+                    # Determine file extension
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'image/jpeg' in content_type:
+                        file_extension = 'jpg'
+                    elif 'image/png' in content_type:
+                        file_extension = 'png'
+                    elif 'image/gif' in content_type:
+                        file_extension = 'gif'
+                    else:
+                        file_extension = 'jpg'
+                    
+                    full_file_name = f"{file_name}.{file_extension}"
+                    file_path = os.path.join(folder, full_file_name)
+                    
+                    # Download with streaming to handle large files
+                    async with aiofiles.open(file_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(8192):
+                            try:
+                                await f.write(chunk)
+                            except OSError as e:
+                                if e.errno == 28:  # No space left on device
+                                    # Clean up partial file
+                                    try:
+                                        os.remove(file_path)
+                                    except OSError:
+                                        pass
+                                    error_msg = f"Disk space error during download: {e}"
+                                    safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                                    return False, error_msg
+                                else:
+                                    raise
+                    
+                    safe_log(f"File downloaded successfully: {url}", logging.INFO)
+                    return True, None
+                else:
+                    safe_log(f"Attempt {attempt + 1}/{retries}: Failed to download {url}. Status code: {response.status}", logging.WARNING)
+                    attempt += 1
+                    if attempt < retries:
+                        await asyncio.sleep(delay)
+        except asyncio.TimeoutError:
+            attempt += 1
+            safe_log(f"Attempt {attempt}/{retries}: Timeout downloading {url}", logging.WARNING)
+            if attempt < retries:
+                await asyncio.sleep(delay)
+        except OSError as e:
+            if e.errno == 28:  # No space left on device
+                error_msg = f"Disk space error: {e}"
+                safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                return False, error_msg
+            else:
+                attempt += 1
+                safe_log(f"Attempt {attempt}/{retries}: Error downloading {url}. Error: {e}", logging.ERROR)
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+        except Exception as e:
+            attempt += 1
+            safe_log(f"Attempt {attempt}/{retries}: Error downloading {url}. Error: {e}", logging.ERROR)
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    
+    # After retries failed
+    safe_log(f"Max retries reached. Failed to download: {url}", logging.ERROR)
+    return False, f"Max retries reached for {url}"
+
 def download_file(url, folder, file_name, sequence, retries=4, delay=15):
     """Download a file with retry logic."""
     attempt = 0
@@ -364,6 +507,82 @@ def download_file(url, folder, file_name, sequence, retries=4, delay=15):
 
 failed_urls_set = set()
 
+async def _worker(session, url, folder, file_name, sequence, failed_downloads, tag_name, good_id):
+    """Worker function for async downloads."""
+    success, error = await async_download_file(session, url, folder, file_name, sequence)
+    if not success and error:
+        if url and url not in failed_urls_set:
+            failed_urls_set.add(url)
+            failed_downloads.append([tag_name, good_id, url])
+    return success
+
+async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
+    """Process downloads for a single vendor using async operations."""
+    if len(qualified_df) == 0:
+        return
+    
+    print(f"Starting async downloads for vendor: {vendor} ({len(qualified_df)} items)", flush=True)
+    safe_log(f"Starting async downloads for vendor: {vendor} ({len(qualified_df)} items)", logging.INFO)
+    
+    total = len(qualified_df)
+    completed = 0
+    failed_downloads = []
+    
+    # Create session with connection limits
+    connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+    timeout = aiohttp.ClientTimeout(total=60)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        tasks = []
+        
+        for index, row in qualified_df.iterrows():
+            good_id = str(row.get('Image Name', '')).strip()
+            first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+            tag_name = str(row.get('Tag Name', '')).strip()
+
+            if not tag_name:
+                tag_name = "Unknown_Tag"
+
+            # Create a vendor folder if it doesn't exist
+            vendor_folder = os.path.join(base_directory, vendor)
+            os.makedirs(vendor_folder, exist_ok=True)
+
+            # Create a subfolder with the tag name inside the vendor folder
+            folder_path = os.path.join(vendor_folder, tag_name)
+            os.makedirs(folder_path, exist_ok=True)
+
+            # Parse the comma-separated image URLs and create download tasks
+            if first_nine_images_str:
+                image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+                
+                for sequence, img_url in enumerate(image_urls, 1):
+                    # Use Tag Name as prefix for file naming
+                    file_prefix = tag_name.replace(' ', '_').replace(',', '_')
+                    file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+                    
+                    task = _worker(session, img_url, folder_path, file_name, sequence, failed_downloads, tag_name, good_id)
+                    tasks.append(task)
+        
+        # Execute all download tasks concurrently
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            completed = len([r for r in results if r is True])
+    
+    print(f"\nVendor {vendor} - Async downloads completed ({completed}/{len(tasks) if tasks else 0} items)", flush=True)
+    safe_log(f"Vendor {vendor} - Async downloads completed ({completed}/{len(tasks) if tasks else 0} items)", logging.INFO)
+    
+    if failed_downloads:
+        failed_df = pd.DataFrame(failed_downloads, columns=["Tag", "Image Name", "URL"])
+        failed_filename = f"failed_downloads_{vendor}.csv"
+        try:
+            failed_df.to_csv(failed_filename, index=False)
+            print(f"Vendor {vendor} - {len(failed_downloads)} failed downloads saved to '{failed_filename}'", flush=True)
+            safe_log(f"Vendor {vendor} - {len(failed_downloads)} failed downloads saved to '{failed_filename}'", logging.WARNING)
+        except OSError as e:
+            if e.errno == 28:  # No space left on device
+                print(f"Vendor {vendor} - Cannot save failed downloads list due to disk space", flush=True)
+            else:
+                raise
 
 def process_download(row, vendor, base_directory, failed_downloads):
     global failed_urls_set
@@ -408,10 +627,16 @@ failed_downloads = []
 def main():
     """Main function to process all vendors concurrently with immediate downloads."""
     print(f"Starting processing for {len(vendors)} vendors", flush=True)
-    logging.info(f"Starting processing for {len(vendors)} vendors")
+    safe_log(f"Starting processing for {len(vendors)} vendors", logging.INFO)
     
-    # Process vendors with a maximum of 5 concurrent operations (data processing + downloads)
-    max_concurrent_vendors = 5
+    # Check initial disk space
+    has_space, free_bytes = check_disk_space(os.getcwd(), 500*1024*1024)  # 500MB minimum
+    if not has_space:
+        print(f"Warning: Low disk space detected. Available: {format_bytes(free_bytes)}")
+        safe_log(f"Warning: Low disk space detected. Available: {format_bytes(free_bytes)}", logging.WARNING)
+    
+    # Process vendors with a maximum of 3 concurrent operations (reduced to save disk space)
+    max_concurrent_vendors = 3
     completed_data_processing = 0
     started_downloads = 0
     
@@ -432,21 +657,23 @@ def main():
             try:
                 qualified_df = data_future.result()
                 if len(qualified_df) > 0:
-                    # Start download process for this vendor immediately
+                    # Start async download process for this vendor immediately
                     # Downloads will run concurrently with other vendor processing
-                    download_future = executor.submit(process_vendor_downloads, vendor, qualified_df, os.getcwd())
+                    download_future = executor.submit(
+                        lambda: asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
+                    )
                     started_downloads += 1
-                    print(f"Vendor {vendor} - Data processing completed ({completed_data_processing}/{len(vendors)}), downloads started immediately", flush=True)
-                    logging.info(f"Vendor {vendor} - Data processing completed, downloads started immediately")
+                    print(f"Vendor {vendor} - Data processing completed ({completed_data_processing}/{len(vendors)}), async downloads started immediately", flush=True)
+                    safe_log(f"Vendor {vendor} - Data processing completed, async downloads started immediately", logging.INFO)
                 else:
                     print(f"Vendor {vendor} - No qualified data to download ({completed_data_processing}/{len(vendors)})", flush=True)
-                    logging.info(f"Vendor {vendor} - No qualified data to download")
+                    safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
             except Exception as e:
                 print(f"Vendor {vendor} - Error processing data: {e} ({completed_data_processing}/{len(vendors)})", flush=True)
-                logging.error(f"Vendor {vendor} - Error processing data: {e}")
+                safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
     
-    print(f"All vendor processing completed. Started downloads for {started_downloads} vendors.", flush=True)
-    logging.info(f"All vendor processing completed. Started downloads for {started_downloads} vendors.")
+    print(f"All vendor processing completed. Started async downloads for {started_downloads} vendors.", flush=True)
+    safe_log(f"All vendor processing completed. Started async downloads for {started_downloads} vendors.", logging.INFO)
 
 # Run the main process
 if __name__ == "__main__":
