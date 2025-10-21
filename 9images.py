@@ -10,6 +10,13 @@ import re
 import random
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import asyncio
+import aiohttp
+import aiofiles
+from tqdm import tqdm
+import threading
+from collections import defaultdict
+import json
 
 # Array of vendors to process
 vendors = [
@@ -280,7 +287,7 @@ def process_vendor_data(vendor, start_date, end_date):
         return pd.DataFrame()
 
 def process_vendor_downloads(vendor, qualified_df, base_directory):
-    """Process downloads for a single vendor with optimized threading."""
+    """Process downloads for a single vendor with optimized threading and progress tracking."""
     if len(qualified_df) == 0:
         return
     
@@ -294,6 +301,10 @@ def process_vendor_downloads(vendor, qualified_df, base_directory):
     completed = 0
     failed_downloads = []
 
+    # Initialize progress tracking
+    progress_tracker.update_vendor_progress(vendor, 0, total, "Starting")
+    progress_tracker.clear_and_display()
+
     # Optimize thread count based on system capabilities
     max_workers = min(50, len(qualified_df) * 9)  # Up to 50 threads, or 9 per item (9 images max)
     
@@ -303,13 +314,15 @@ def process_vendor_downloads(vendor, qualified_df, base_directory):
 
         for future in concurrent.futures.as_completed(futures):
             completed += 1
-            progress = (completed / total) * 100
-            sys.stdout.write(f"\rVendor {vendor} - Progress: {completed:>4}/{total:<4} | {progress:>6.2f}% completed")
-            sys.stdout.flush()
+            progress_tracker.update_vendor_progress(vendor, completed, total, "Downloading")
+            progress_tracker.clear_and_display()
 
     end_time = time.time()
     duration = end_time - start_time
     images_per_second = total_images / duration if duration > 0 else 0
+    
+    progress_tracker.update_vendor_progress(vendor, completed, total, "Completed")
+    progress_tracker.clear_and_display()
     
     print(f"\nVendor {vendor} - Downloads completed ({completed}/{total} items) in {duration:.2f}s", flush=True)
     print(f"Vendor {vendor} - Performance: {images_per_second:.2f} images/second", flush=True)
@@ -360,8 +373,231 @@ def create_optimized_session():
 # Global session for reuse
 download_session = create_optimized_session()
 
+# Progress tracking system
+class ProgressTracker:
+    def __init__(self):
+        self.vendor_progress = defaultdict(lambda: {'completed': 0, 'total': 0, 'status': 'Processing'})
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+    
+    def update_vendor_progress(self, vendor, completed, total, status='Downloading'):
+        with self.lock:
+            self.vendor_progress[vendor] = {
+                'completed': completed,
+                'total': total,
+                'status': status,
+                'percentage': (completed / total * 100) if total > 0 else 0
+            }
+    
+    def get_progress_display(self):
+        with self.lock:
+            elapsed = time.time() - self.start_time
+            lines = []
+            lines.append("=" * 100)
+            lines.append(f"DOWNLOAD PROGRESS - Elapsed: {elapsed:.1f}s")
+            lines.append("=" * 100)
+            
+            for vendor, progress in self.vendor_progress.items():
+                bar_length = 30
+                filled_length = int(bar_length * progress['percentage'] / 100)
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                
+                lines.append(f"{vendor[:20]:<20} |{bar}| {progress['percentage']:6.1f}% | {progress['completed']:>4}/{progress['total']:<4} | {progress['status']}")
+            
+            lines.append("=" * 100)
+            return '\n'.join(lines)
+    
+    def clear_and_display(self):
+        # Clear screen and move cursor to top
+        os.system('clear' if os.name == 'posix' else 'cls')
+        print(self.get_progress_display(), flush=True)
+
+# Global progress tracker
+progress_tracker = ProgressTracker()
+
+# Progress monitoring thread
+def progress_monitor():
+    """Monitor and display progress continuously."""
+    while True:
+        try:
+            progress_tracker.clear_and_display()
+            time.sleep(2)  # Update every 2 seconds
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logging.error(f"Progress monitor error: {e}")
+            time.sleep(5)
+
+# Async version of vendor processing (Alternative Solution 1)
+async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
+    """Process downloads for a single vendor using async/await for maximum performance."""
+    if len(qualified_df) == 0:
+        return
+    
+    start_time = time.time()
+    total_images = len(qualified_df) * 9
+    
+    print(f"Starting ASYNC downloads for vendor: {vendor} ({len(qualified_df)} items, ~{total_images} images)", flush=True)
+    logging.info(f"Starting ASYNC downloads for vendor: {vendor} ({len(qualified_df)} items, ~{total_images} images)")
+    
+    total = len(qualified_df)
+    completed = 0
+    failed_downloads = []
+
+    # Initialize progress tracking
+    progress_tracker.update_vendor_progress(vendor, 0, total, "Starting Async")
+    progress_tracker.clear_and_display()
+
+    # Create download queue
+    download_queue = DownloadQueue()
+    
+    # Add all downloads to queue
+    for index, row in qualified_df.iterrows():
+        good_id = str(row.get('Image Name', '')).strip()
+        first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+        tag_name = str(row.get('Tag Name', '')).strip()
+
+        if not tag_name:
+            tag_name = "Unknown_Tag"
+
+        # Create folders
+        vendor_folder = os.path.join(base_directory, vendor)
+        os.makedirs(vendor_folder, exist_ok=True)
+        folder_path = os.path.join(vendor_folder, tag_name)
+        os.makedirs(folder_path, exist_ok=True)
+
+        if first_nine_images_str:
+            image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+            
+            for sequence, img_url in enumerate(image_urls, 1):
+                file_prefix = tag_name.replace(' ', '_').replace(',', '_')
+                file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+                
+                # Add to download queue with priority
+                await download_queue.add_download(img_url, folder_path, file_name, sequence, priority=index)
+
+    # Process downloads with high concurrency
+    await download_queue.process_downloads(max_workers=100)
+    
+    # Update final progress
+    completed = total
+    end_time = time.time()
+    duration = end_time - start_time
+    images_per_second = total_images / duration if duration > 0 else 0
+    
+    progress_tracker.update_vendor_progress(vendor, completed, total, "Completed Async")
+    progress_tracker.clear_and_display()
+    
+    print(f"\nVendor {vendor} - ASYNC Downloads completed ({completed}/{total} items) in {duration:.2f}s", flush=True)
+    print(f"Vendor {vendor} - ASYNC Performance: {images_per_second:.2f} images/second", flush=True)
+    logging.info(f"Vendor {vendor} - ASYNC Downloads completed ({completed}/{total} items) in {duration:.2f}s")
+    logging.info(f"Vendor {vendor} - ASYNC Performance: {images_per_second:.2f} images/second")
+    
+    return download_queue.failed_downloads
+
+# Alternative Solution 1: Async Download Function
+async def async_download_file(session, url, folder, file_name, sequence, quality=85):
+    """Async download with compression using aiohttp."""
+    try:
+        async with session.get(url, headers=imgheaders, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                # Determine file extension
+                content_type = response.headers.get('Content-Type', '')
+                if 'image/jpeg' in content_type:
+                    file_extension = 'jpg'
+                elif 'image/png' in content_type:
+                    file_extension = 'png'
+                elif 'image/gif' in content_type:
+                    file_extension = 'gif'
+                else:
+                    file_extension = 'jpg'
+
+                full_file_name = f"{file_name}.{file_extension}"
+                file_path = os.path.join(folder, full_file_name)
+
+                # Download and save
+                async with aiofiles.open(file_path, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(65536):
+                        await f.write(chunk)
+
+                # Compress the image
+                await compress_image_async(file_path, quality)
+                
+                return True, None
+            else:
+                return False, (file_name, url)
+    except Exception as e:
+        logging.error(f"Async download error for {url}: {e}")
+        return False, (file_name, url)
+
+async def compress_image_async(image_path, quality=85, max_size=(1920, 1080)):
+    """Async image compression."""
+    try:
+        # Run compression in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, compress_image_sync, image_path, quality, max_size)
+    except Exception as e:
+        logging.error(f"Compression error for {image_path}: {e}")
+
+def compress_image_sync(image_path, quality=85, max_size=(1920, 1080)):
+    """Synchronous image compression."""
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            img.save(image_path, 'JPEG', quality=quality, optimize=True)
+    except Exception as e:
+        logging.error(f"Sync compression error for {image_path}: {e}")
+
+# Alternative Solution 2: Download Queue System
+class DownloadQueue:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.results = {}
+        self.failed_downloads = []
+    
+    async def add_download(self, url, folder, file_name, sequence, priority=0):
+        await self.queue.put((priority, url, folder, file_name, sequence))
+    
+    async def process_downloads(self, max_workers=50):
+        """Process downloads with priority queue."""
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for _ in range(max_workers):
+                task = asyncio.create_task(self._worker(session))
+                tasks.append(task)
+            
+            await asyncio.gather(*tasks)
+    
+    async def _worker(self, session):
+        """Worker coroutine for processing downloads."""
+        while True:
+            try:
+                priority, url, folder, file_name, sequence = await asyncio.wait_for(
+                    self.queue.get(), timeout=1.0
+                )
+                
+                success, error = await async_download_file(session, url, folder, file_name, sequence)
+                
+                if success:
+                    self.results[url] = True
+                else:
+                    self.results[url] = False
+                    if error:
+                        self.failed_downloads.append(error)
+                
+                self.queue.task_done()
+            except asyncio.TimeoutError:
+                break
+            except Exception as e:
+                logging.error(f"Worker error: {e}")
+                break
+
 def download_file(url, folder, file_name, sequence, retries=3, delay=2):
-    """Download a file with optimized retry logic and connection pooling."""
+    """Download a file with optimized retry logic, connection pooling, and compression."""
     global download_session
     
     for attempt in range(retries):
@@ -396,6 +632,9 @@ def download_file(url, folder, file_name, sequence, retries=3, delay=2):
                     for chunk in response.iter_content(chunk_size=65536):  # 64KB chunks
                         if chunk:  # Filter out keep-alive chunks
                             file.write(chunk)
+
+                # Compress the downloaded image
+                compress_image_sync(file_path, quality=85, max_size=(1920, 1080))
 
                 return True, None
             else:
@@ -474,10 +713,16 @@ def main():
     - No waiting for all vendors to finish before starting downloads
     - Up to 10 vendors can process data + download images simultaneously
     - This creates an overlapping pipeline for maximum efficiency
+    - Uses both sync and async approaches for maximum performance
     """
     print(f"Starting processing for {len(vendors)} vendors with {max_concurrent_vendors} concurrent operations", flush=True)
     print("Downloads will start IMMEDIATELY as each vendor's data processing completes", flush=True)
+    print("Using optimized threading + async downloads + compression + progress tracking", flush=True)
     logging.info(f"Starting processing for {len(vendors)} vendors with {max_concurrent_vendors} concurrent operations")
+    
+    # Start progress monitoring thread
+    progress_thread = threading.Thread(target=progress_monitor, daemon=True)
+    progress_thread.start()
     
     # Process vendors with a maximum of 10 concurrent operations (data processing + downloads)
     max_concurrent_vendors = 10
@@ -501,9 +746,18 @@ def main():
             try:
                 qualified_df = data_future.result()
                 if len(qualified_df) > 0:
-                    # Start download process for this vendor immediately
-                    # Downloads will run concurrently with other vendor processing
-                    download_future = executor.submit(process_vendor_downloads, vendor, qualified_df, os.getcwd())
+                    # Choose between sync and async processing
+                    use_async = True  # Set to False for sync processing
+                    
+                    if use_async:
+                        # Start async download process
+                        download_future = executor.submit(
+                            lambda: asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
+                        )
+                    else:
+                        # Start sync download process
+                        download_future = executor.submit(process_vendor_downloads, vendor, qualified_df, os.getcwd())
+                    
                     started_downloads += 1
                     print(f"Vendor {vendor} - Data processing completed ({completed_data_processing}/{len(vendors)}), downloads started immediately", flush=True)
                     logging.info(f"Vendor {vendor} - Data processing completed, downloads started immediately")
@@ -516,7 +770,22 @@ def main():
     
     print(f"All vendor processing completed. Started downloads for {started_downloads} vendors.", flush=True)
     print("Note: Downloads run concurrently and may still be in progress.", flush=True)
+    print("Progress monitoring will continue until all downloads complete.", flush=True)
     logging.info(f"All vendor processing completed. Started downloads for {started_downloads} vendors.")
+    
+    # Wait for progress monitoring to continue
+    try:
+        while True:
+            time.sleep(10)
+            # Check if all vendors are completed
+            all_completed = all(
+                progress['status'] in ['Completed', 'Completed Async'] 
+                for progress in progress_tracker.vendor_progress.values()
+            )
+            if all_completed:
+                break
+    except KeyboardInterrupt:
+        print("\nProgress monitoring stopped by user.", flush=True)
 
 # Run the main process
 if __name__ == "__main__":
