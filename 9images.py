@@ -8,6 +8,8 @@ import sys
 import time
 import re
 import random
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Array of vendors to process
 vendors = [
@@ -278,18 +280,24 @@ def process_vendor_data(vendor, start_date, end_date):
         return pd.DataFrame()
 
 def process_vendor_downloads(vendor, qualified_df, base_directory):
-    """Process downloads for a single vendor."""
+    """Process downloads for a single vendor with optimized threading."""
     if len(qualified_df) == 0:
         return
     
-    print(f"Starting downloads for vendor: {vendor} ({len(qualified_df)} items)", flush=True)
-    logging.info(f"Starting downloads for vendor: {vendor} ({len(qualified_df)} items)")
+    start_time = time.time()
+    total_images = len(qualified_df) * 9  # Approximate total images
+    
+    print(f"Starting downloads for vendor: {vendor} ({len(qualified_df)} items, ~{total_images} images)", flush=True)
+    logging.info(f"Starting downloads for vendor: {vendor} ({len(qualified_df)} items, ~{total_images} images)")
     
     total = len(qualified_df)
     completed = 0
     failed_downloads = []
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    # Optimize thread count based on system capabilities
+    max_workers = min(50, len(qualified_df) * 9)  # Up to 50 threads, or 9 per item (9 images max)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_download, row, vendor, base_directory, failed_downloads): index 
                   for index, row in qualified_df.iterrows()}
 
@@ -299,8 +307,14 @@ def process_vendor_downloads(vendor, qualified_df, base_directory):
             sys.stdout.write(f"\rVendor {vendor} - Progress: {completed:>4}/{total:<4} | {progress:>6.2f}% completed")
             sys.stdout.flush()
 
-    print(f"\nVendor {vendor} - Downloads completed ({completed}/{total} items)", flush=True)
-    logging.info(f"Vendor {vendor} - Downloads completed ({completed}/{total} items)")
+    end_time = time.time()
+    duration = end_time - start_time
+    images_per_second = total_images / duration if duration > 0 else 0
+    
+    print(f"\nVendor {vendor} - Downloads completed ({completed}/{total} items) in {duration:.2f}s", flush=True)
+    print(f"Vendor {vendor} - Performance: {images_per_second:.2f} images/second", flush=True)
+    logging.info(f"Vendor {vendor} - Downloads completed ({completed}/{total} items) in {duration:.2f}s")
+    logging.info(f"Vendor {vendor} - Performance: {images_per_second:.2f} images/second")
     
     if failed_downloads:
         failed_df = pd.DataFrame(failed_downloads, columns=["Tag", "Image Name", "URL"])
@@ -317,13 +331,50 @@ imgheaders = {
     'sec-ch-ua-platform': '"Windows"',
 }
 
-def download_file(url, folder, file_name, sequence, retries=4, delay=15):
-    """Download a file with retry logic."""
-    attempt = 0
+# Create optimized session with connection pooling
+def create_optimized_session():
+    """Create a session with optimized connection pooling and retry strategy."""
+    session = requests.Session()
+    
+    # Configure retry strategy
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    
+    # Configure adapter with connection pooling
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=20,  # Number of connection pools
+        pool_maxsize=100,     # Maximum number of connections in the pool
+        pool_block=False      # Don't block when pool is full
+    )
+    
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
 
-    while attempt < retries:
+# Global session for reuse
+download_session = create_optimized_session()
+
+def download_file(url, folder, file_name, sequence, retries=3, delay=2):
+    """Download a file with optimized retry logic and connection pooling."""
+    global download_session
+    
+    for attempt in range(retries):
         try:
-            response = requests.get(url, headers=imgheaders, stream=True, timeout=30)  # add timeout to avoid hanging
+            # Use the optimized session with connection pooling
+            response = download_session.get(
+                url, 
+                headers=imgheaders, 
+                stream=True, 
+                timeout=15,  # Reduced timeout for faster failure detection
+                allow_redirects=True
+            )
+            
             if response.status_code == 200:
                 # Determine the file extension from Content-Type
                 content_type = response.headers.get('Content-Type', '')
@@ -340,26 +391,25 @@ def download_file(url, folder, file_name, sequence, retries=4, delay=15):
                 full_file_name = f"{file_name}.{file_extension}"
                 file_path = os.path.join(folder, full_file_name)
 
+                # Optimized file writing with larger chunks
                 with open(file_path, 'wb') as file:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        file.write(chunk)
+                    for chunk in response.iter_content(chunk_size=65536):  # 64KB chunks
+                        if chunk:  # Filter out keep-alive chunks
+                            file.write(chunk)
 
-                logging.info(f"File downloaded successfully: {url}")
                 return True, None
             else:
                 logging.warning(f"Attempt {attempt + 1}/{retries}: Failed to download {url}. Status code: {response.status_code}")
-                attempt += 1
-                if attempt < retries:
-                    time.sleep(delay)
+                if attempt < retries - 1:
+                    time.sleep(delay * (attempt + 1))  # Exponential backoff
         except Exception as e:
-            attempt += 1
-            logging.error(f"Attempt {attempt}/{retries}: Error downloading {url}. Error: {e}")
-            if attempt < retries:
-                time.sleep(delay)
+            logging.error(f"Attempt {attempt + 1}/{retries}: Error downloading {url}. Error: {e}")
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))  # Exponential backoff
 
     # After retries failed
     logging.error(f"Max retries reached. Failed to download: {url}")
-    return False, (good_id, url)
+    return False, (file_name, url)
 
 
 failed_urls_set = set()
@@ -392,13 +442,24 @@ def process_download(row, vendor, base_directory, failed_downloads):
     if first_nine_images_str:
         image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
         
-        for sequence, img_url in enumerate(image_urls, 1):
-            # Use Tag Name as prefix for file naming
-            file_prefix = tag_name.replace(' ', '_').replace(',', '_')
-            file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
-            success, error = download_file(img_url, folder_path, file_name, sequence)
-            if not success and error:
-                handle_failed_download(img_url)
+        # Download images concurrently within each product
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(9, len(image_urls))) as img_executor:
+            img_futures = []
+            
+            for sequence, img_url in enumerate(image_urls, 1):
+                # Use Tag Name as prefix for file naming
+                file_prefix = tag_name.replace(' ', '_').replace(',', '_')
+                file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+                
+                # Submit download task
+                future = img_executor.submit(download_file, img_url, folder_path, file_name, sequence)
+                img_futures.append((future, img_url))
+            
+            # Wait for all images of this product to complete
+            for future, img_url in img_futures:
+                success, error = future.result()
+                if not success and error:
+                    handle_failed_download(img_url)
 
 
     
