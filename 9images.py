@@ -327,12 +327,15 @@ def extract_data(data):
 
 
 def process_vendor_data(vendor, start_date, end_date):
-    """Process data for a single vendor with pagination."""
+    """Process data for a single vendor with pagination and timeout protection."""
     print(f"Processing vendor: {vendor}", flush=True)
-    logging.info(f"Processing vendor: {vendor}")
+    safe_log(f"Processing vendor: {vendor}", logging.INFO)
     
     All_data = pd.DataFrame()
     next_page = ''
+    page_count = 0
+    max_pages = 50  # Limit pages to prevent infinite loops
+    
     data = request_data(vendor, start_date, end_date, next_page)
     totall = 0
     
@@ -340,12 +343,15 @@ def process_vendor_data(vendor, start_date, end_date):
         pag_data = data.get('result', {}).get('pagination', {})
         next_page = check_pagination(pag_data)
 
-    while next_page:
+    while next_page and page_count < max_pages:
+        page_count += 1
+        print(f"   📄 Processing page {page_count} for {vendor}")
+        
         # Ensure the API request was successful before processing
         if data:
             extracted_data = extract_data(data)
             totall = totall + len(extracted_data)
-            print(f"Vendor {vendor} - Results added: {len(extracted_data)}, TOTAL: {totall}", flush=True)
+            print(f"   📊 Vendor {vendor} - Results added: {len(extracted_data)}, TOTAL: {totall}", flush=True)
             All_data = pd.concat([All_data, extracted_data], ignore_index=True)
 
             pag_data = data.get('result', {}).get('pagination', {})  # Safely retrieve pagination data
@@ -359,6 +365,10 @@ def process_vendor_data(vendor, start_date, end_date):
         else:
             break  # Stop loop if API request fails
 
+    if page_count >= max_pages:
+        print(f"   ⚠️  Vendor {vendor} - Reached maximum pages limit ({max_pages})", flush=True)
+        safe_log(f"Vendor {vendor} - Reached maximum pages limit", logging.WARNING)
+
     # Filter Data - Updated to check for First Nine Images instead of First Image
     if len(All_data) > 0:
         qualified_df = All_data[
@@ -367,10 +377,10 @@ def process_vendor_data(vendor, start_date, end_date):
             (All_data['No of images'] > 4)  # Ensure No of images is greater than 4
         ]
         
-        print(f"Vendor {vendor} - QUALIFIED RESULTS AFTER FILTER: {len(qualified_df)} (first 9 images)", flush=True)
+        print(f"   ✅ Vendor {vendor} - QUALIFIED RESULTS: {len(qualified_df)} (first 9 images)", flush=True)
         return qualified_df
     else:
-        print(f"Vendor {vendor} - No data to process.", flush=True)
+        print(f"   ⏭️  Vendor {vendor} - No data to process.", flush=True)
         return pd.DataFrame()
 
 def process_vendor_downloads(vendor, qualified_df, base_directory):
@@ -605,18 +615,27 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
             total_files += len(image_urls)
     
     if total_files == 0:
-        print(f"Vendor {vendor} - No files to download", flush=True)
+        print(f"   ⏭️  Vendor {vendor} - No files to download", flush=True)
         return
     
-    print(f"\n🚀 Starting downloads for vendor: {vendor} ({total_files} files)")
+    # Limit files per vendor to prevent excessive downloads
+    max_files_per_vendor = 500
+    if total_files > max_files_per_vendor:
+        print(f"   ⚠️  Vendor {vendor} - Limiting to {max_files_per_vendor} files (was {total_files})")
+        # Take only first 500 files worth of items
+        items_to_process = max_files_per_vendor // 9  # Assuming 9 images per item
+        qualified_df = qualified_df.head(items_to_process)
+        total_files = min(total_files, max_files_per_vendor)
+    
+    print(f"   🚀 Starting downloads for {vendor} ({total_files} files)")
     safe_log(f"Starting async downloads for vendor: {vendor} ({len(qualified_df)} items, {total_files} files)", logging.INFO)
     
     completed = 0
     failed_downloads = []
     
-    # Create session with connection limits
-    connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
-    timeout = aiohttp.ClientTimeout(total=60)
+    # Create session with connection limits and shorter timeouts
+    connector = aiohttp.TCPConnector(limit=5, limit_per_host=3)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
     
     # Create progress bar for this vendor (cleaner format)
     with tqdm(total=total_files, desc=f"📥 {vendor}", unit="file", 
@@ -772,7 +791,8 @@ def main():
         print(f"\n📊 Processing vendor {i}/{len(vendors)}: {vendor}")
         
         try:
-            # Process data for the vendor
+            # Process data for the vendor with timeout
+            print(f"   🔍 Fetching data for {vendor}...")
             qualified_df = process_vendor_data(vendor, start_date, end_date)
             
             if len(qualified_df) > 0:
@@ -788,23 +808,34 @@ def main():
                 progress_tracker.total_files += total_files
                 total_files_processed += total_files
                 
-                print(f"✅ {vendor}: {total_files} files queued")
+                print(f"   ✅ {vendor}: {total_files} files queued")
                 
-                # Start async download process for this vendor
+                # Start async download process for this vendor with timeout
                 try:
-                    asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
+                    print(f"   📥 Starting downloads for {vendor}...")
+                    # Add timeout to prevent infinite loops
+                    asyncio.wait_for(
+                        process_vendor_downloads_async(vendor, qualified_df, os.getcwd()),
+                        timeout=1800  # 30 minutes timeout per vendor
+                    )
                     completed_vendors += 1
-                    print(f"✅ {vendor}: Download completed")
+                    print(f"   ✅ {vendor}: Download completed")
+                except asyncio.TimeoutError:
+                    print(f"   ⏰ {vendor}: Download timeout (30min) - skipping")
+                    safe_log(f"Vendor {vendor} - Download timeout", logging.WARNING)
                 except Exception as e:
-                    print(f"❌ {vendor}: Download error - {e}")
+                    print(f"   ❌ {vendor}: Download error - {e}")
                     safe_log(f"Vendor {vendor} - Download error: {e}", logging.ERROR)
             else:
-                print(f"⏭️  {vendor}: No data")
+                print(f"   ⏭️  {vendor}: No data")
                 safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
                 
         except Exception as e:
-            print(f"❌ {vendor}: Processing error - {e}")
+            print(f"   ❌ {vendor}: Processing error - {e}")
             safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
+        
+        # Add a small delay between vendors to prevent overwhelming the system
+        time.sleep(1)
     
     print(f"\n🎉 Processing complete! {completed_vendors} vendors, {total_files_processed} files")
     print("=" * 80)
