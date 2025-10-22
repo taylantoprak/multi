@@ -12,6 +12,8 @@ import shutil
 import asyncio
 import aiohttp
 import aiofiles
+from tqdm import tqdm
+import threading
 
 # Array of vendors to process
 vendors = [
@@ -124,6 +126,46 @@ def format_bytes(bytes_value):
             return f"{bytes_value:.1f} {unit}"
         bytes_value /= 1024.0
     return f"{bytes_value:.1f} PB"
+
+class ProgressTracker:
+    """Thread-safe progress tracking for downloads."""
+    def __init__(self, total_vendors, total_files=0):
+        self.total_vendors = total_vendors
+        self.total_files = total_files
+        self.completed_vendors = 0
+        self.completed_files = 0
+        self.failed_files = 0
+        self.lock = threading.Lock()
+        self.vendor_progress = {}
+        self.start_time = time.time()
+        
+    def update_vendor_progress(self, vendor, completed, total, failed=0):
+        with self.lock:
+            self.vendor_progress[vendor] = {
+                'completed': completed,
+                'total': total,
+                'failed': failed,
+                'percentage': (completed / total * 100) if total > 0 else 0
+            }
+    
+    def update_file_progress(self, completed=1, failed=0):
+        with self.lock:
+            self.completed_files += completed
+            self.failed_files += failed
+    
+    def complete_vendor(self, vendor):
+        with self.lock:
+            self.completed_vendors += 1
+    
+    def get_overall_progress(self):
+        with self.lock:
+            vendor_pct = (self.completed_vendors / self.total_vendors * 100) if self.total_vendors > 0 else 0
+            file_pct = (self.completed_files / self.total_files * 100) if self.total_files > 0 else 0
+            elapsed = time.time() - self.start_time
+            return vendor_pct, file_pct, elapsed, self.completed_files, self.failed_files
+
+# Global progress tracker
+progress_tracker = None
 
 def safe_log(message, level=logging.INFO):
     """Safely log a message, handling disk space errors."""
@@ -371,8 +413,8 @@ imgheaders = {
     'sec-ch-ua-platform': '"Windows"',
 }
 
-async def async_download_file(session, url, folder, file_name, sequence, retries=4, delay=15):
-    """Async download a file with retry logic and disk space checking."""
+async def async_download_file(session, url, folder, file_name, sequence, vendor, pbar=None, retries=4, delay=15):
+    """Async download a file with retry logic, disk space checking, and progress tracking."""
     attempt = 0
     
     while attempt < retries:
@@ -382,18 +424,23 @@ async def async_download_file(session, url, folder, file_name, sequence, retries
             if not has_space:
                 error_msg = f"Insufficient disk space. Available: {format_bytes(free_bytes)}"
                 safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                if pbar:
+                    pbar.set_description(f"❌ {vendor} - Disk space error")
                 return False, error_msg
             
             async with session.get(url, headers=imgheaders, timeout=30) as response:
                 if response.status == 200:
                     # Get content length for additional space check
                     content_length = response.headers.get('Content-Length')
-                    if content_length:
-                        file_size = int(content_length)
+                    file_size = int(content_length) if content_length else 0
+                    
+                    if file_size > 0:
                         has_space, free_bytes = check_disk_space(folder, file_size + 10*1024*1024)  # 10MB buffer
                         if not has_space:
                             error_msg = f"Insufficient disk space for file. Required: {format_bytes(file_size)}, Available: {format_bytes(free_bytes)}"
                             safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                            if pbar:
+                                pbar.set_description(f"❌ {vendor} - Disk space error")
                             return False, error_msg
                     
                     # Determine file extension
@@ -410,11 +457,19 @@ async def async_download_file(session, url, folder, file_name, sequence, retries
                     full_file_name = f"{file_name}.{file_extension}"
                     file_path = os.path.join(folder, full_file_name)
                     
-                    # Download with streaming to handle large files
+                    # Download with streaming and progress tracking
+                    downloaded_size = 0
                     async with aiofiles.open(file_path, 'wb') as f:
                         async for chunk in response.content.iter_chunked(8192):
                             try:
                                 await f.write(chunk)
+                                downloaded_size += len(chunk)
+                                
+                                # Update progress bar if available
+                                if pbar and file_size > 0:
+                                    progress_pct = (downloaded_size / file_size) * 100
+                                    pbar.set_description(f"📥 {vendor} - Downloading {file_name[:30]}... {progress_pct:.1f}%")
+                                
                             except OSError as e:
                                 if e.errno == 28:  # No space left on device
                                     # Clean up partial file
@@ -424,9 +479,15 @@ async def async_download_file(session, url, folder, file_name, sequence, retries
                                         pass
                                     error_msg = f"Disk space error during download: {e}"
                                     safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                                    if pbar:
+                                        pbar.set_description(f"❌ {vendor} - Disk space error")
                                     return False, error_msg
                                 else:
                                     raise
+                    
+                    # Update progress tracker
+                    if progress_tracker:
+                        progress_tracker.update_file_progress(completed=1)
                     
                     safe_log(f"File downloaded successfully: {url}", logging.INFO)
                     return True, None
@@ -434,30 +495,42 @@ async def async_download_file(session, url, folder, file_name, sequence, retries
                     safe_log(f"Attempt {attempt + 1}/{retries}: Failed to download {url}. Status code: {response.status}", logging.WARNING)
                     attempt += 1
                     if attempt < retries:
+                        if pbar:
+                            pbar.set_description(f"🔄 {vendor} - Retrying {file_name[:30]}... (Attempt {attempt})")
                         await asyncio.sleep(delay)
         except asyncio.TimeoutError:
             attempt += 1
             safe_log(f"Attempt {attempt}/{retries}: Timeout downloading {url}", logging.WARNING)
             if attempt < retries:
+                if pbar:
+                    pbar.set_description(f"⏰ {vendor} - Timeout, retrying {file_name[:30]}...")
                 await asyncio.sleep(delay)
         except OSError as e:
             if e.errno == 28:  # No space left on device
                 error_msg = f"Disk space error: {e}"
                 safe_log(f"Disk space error for {url}: {error_msg}", logging.ERROR)
+                if pbar:
+                    pbar.set_description(f"❌ {vendor} - Disk space error")
                 return False, error_msg
             else:
                 attempt += 1
                 safe_log(f"Attempt {attempt}/{retries}: Error downloading {url}. Error: {e}", logging.ERROR)
                 if attempt < retries:
+                    if pbar:
+                        pbar.set_description(f"🔄 {vendor} - Error, retrying {file_name[:30]}...")
                     await asyncio.sleep(delay)
         except Exception as e:
             attempt += 1
             safe_log(f"Attempt {attempt}/{retries}: Error downloading {url}. Error: {e}", logging.ERROR)
             if attempt < retries:
+                if pbar:
+                    pbar.set_description(f"🔄 {vendor} - Error, retrying {file_name[:30]}...")
                 await asyncio.sleep(delay)
     
     # After retries failed
     safe_log(f"Max retries reached. Failed to download: {url}", logging.ERROR)
+    if pbar:
+        pbar.set_description(f"❌ {vendor} - Failed {file_name[:30]} after {retries} attempts")
     return False, f"Max retries reached for {url}"
 
 def download_file(url, folder, file_name, sequence, retries=4, delay=15):
@@ -507,24 +580,38 @@ def download_file(url, folder, file_name, sequence, retries=4, delay=15):
 
 failed_urls_set = set()
 
-async def _worker(session, url, folder, file_name, sequence, failed_downloads, tag_name, good_id):
+async def _worker(session, url, folder, file_name, sequence, failed_downloads, tag_name, good_id, vendor, pbar=None):
     """Worker function for async downloads."""
-    success, error = await async_download_file(session, url, folder, file_name, sequence)
+    success, error = await async_download_file(session, url, folder, file_name, sequence, vendor, pbar)
     if not success and error:
         if url and url not in failed_urls_set:
             failed_urls_set.add(url)
             failed_downloads.append([tag_name, good_id, url])
+        if progress_tracker:
+            progress_tracker.update_file_progress(failed=1)
     return success
 
 async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
-    """Process downloads for a single vendor using async operations."""
+    """Process downloads for a single vendor using async operations with visual progress."""
     if len(qualified_df) == 0:
         return
     
-    print(f"Starting async downloads for vendor: {vendor} ({len(qualified_df)} items)", flush=True)
-    safe_log(f"Starting async downloads for vendor: {vendor} ({len(qualified_df)} items)", logging.INFO)
+    # Count total files to download
+    total_files = 0
+    for index, row in qualified_df.iterrows():
+        first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+        if first_nine_images_str:
+            image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+            total_files += len(image_urls)
     
-    total = len(qualified_df)
+    if total_files == 0:
+        print(f"Vendor {vendor} - No files to download", flush=True)
+        return
+    
+    print(f"\n🚀 Starting downloads for vendor: {vendor}")
+    print(f"📊 Items: {len(qualified_df)}, Files: {total_files}")
+    safe_log(f"Starting async downloads for vendor: {vendor} ({len(qualified_df)} items, {total_files} files)", logging.INFO)
+    
     completed = 0
     failed_downloads = []
     
@@ -532,55 +619,82 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
     connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
     timeout = aiohttp.ClientTimeout(total=60)
     
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = []
+    # Create progress bar for this vendor
+    with tqdm(total=total_files, desc=f"📥 {vendor}", unit="file", 
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} files [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
         
-        for index, row in qualified_df.iterrows():
-            good_id = str(row.get('Image Name', '')).strip()
-            first_nine_images_str = str(row.get('First Nine Images', '')).strip()
-            tag_name = str(row.get('Tag Name', '')).strip()
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            tasks = []
+            
+            for index, row in qualified_df.iterrows():
+                good_id = str(row.get('Image Name', '')).strip()
+                first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+                tag_name = str(row.get('Tag Name', '')).strip()
 
-            if not tag_name:
-                tag_name = "Unknown_Tag"
+                if not tag_name:
+                    tag_name = "Unknown_Tag"
 
-            # Create a vendor folder if it doesn't exist
-            vendor_folder = os.path.join(base_directory, vendor)
-            os.makedirs(vendor_folder, exist_ok=True)
+                # Create a vendor folder if it doesn't exist
+                vendor_folder = os.path.join(base_directory, vendor)
+                os.makedirs(vendor_folder, exist_ok=True)
 
-            # Create a subfolder with the tag name inside the vendor folder
-            folder_path = os.path.join(vendor_folder, tag_name)
-            os.makedirs(folder_path, exist_ok=True)
+                # Create a subfolder with the tag name inside the vendor folder
+                folder_path = os.path.join(vendor_folder, tag_name)
+                os.makedirs(folder_path, exist_ok=True)
 
-            # Parse the comma-separated image URLs and create download tasks
-            if first_nine_images_str:
-                image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
-                
-                for sequence, img_url in enumerate(image_urls, 1):
-                    # Use Tag Name as prefix for file naming
-                    file_prefix = tag_name.replace(' ', '_').replace(',', '_')
-                    file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+                # Parse the comma-separated image URLs and create download tasks
+                if first_nine_images_str:
+                    image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
                     
-                    task = _worker(session, img_url, folder_path, file_name, sequence, failed_downloads, tag_name, good_id)
-                    tasks.append(task)
-        
-        # Execute all download tasks concurrently
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            completed = len([r for r in results if r is True])
+                    for sequence, img_url in enumerate(image_urls, 1):
+                        # Use Tag Name as prefix for file naming
+                        file_prefix = tag_name.replace(' ', '_').replace(',', '_')
+                        file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+                        
+                        task = _worker(session, img_url, folder_path, file_name, sequence, 
+                                     failed_downloads, tag_name, good_id, vendor, pbar)
+                        tasks.append(task)
+            
+            # Execute all download tasks with progress tracking
+            if tasks:
+                # Process tasks in batches to show progress
+                batch_size = 10
+                for i in range(0, len(tasks), batch_size):
+                    batch = tasks[i:i + batch_size]
+                    results = await asyncio.gather(*batch, return_exceptions=True)
+                    
+                    # Update progress bar
+                    batch_completed = len([r for r in results if r is True])
+                    pbar.update(batch_completed)
+                    completed += batch_completed
+                    
+                    # Update vendor progress in global tracker
+                    if progress_tracker:
+                        progress_tracker.update_vendor_progress(vendor, completed, total_files, len(failed_downloads))
     
-    print(f"\nVendor {vendor} - Async downloads completed ({completed}/{len(tasks) if tasks else 0} items)", flush=True)
-    safe_log(f"Vendor {vendor} - Async downloads completed ({completed}/{len(tasks) if tasks else 0} items)", logging.INFO)
+    # Mark vendor as completed
+    if progress_tracker:
+        progress_tracker.complete_vendor(vendor)
+    
+    # Print completion summary
+    success_rate = (completed / total_files * 100) if total_files > 0 else 0
+    print(f"\n✅ Vendor {vendor} completed!")
+    print(f"📈 Success: {completed}/{total_files} files ({success_rate:.1f}%)")
+    if failed_downloads:
+        print(f"❌ Failed: {len(failed_downloads)} files")
+    
+    safe_log(f"Vendor {vendor} - Downloads completed ({completed}/{total_files} files, {success_rate:.1f}% success)", logging.INFO)
     
     if failed_downloads:
         failed_df = pd.DataFrame(failed_downloads, columns=["Tag", "Image Name", "URL"])
         failed_filename = f"failed_downloads_{vendor}.csv"
         try:
             failed_df.to_csv(failed_filename, index=False)
-            print(f"Vendor {vendor} - {len(failed_downloads)} failed downloads saved to '{failed_filename}'", flush=True)
+            print(f"💾 Failed downloads saved to '{failed_filename}'")
             safe_log(f"Vendor {vendor} - {len(failed_downloads)} failed downloads saved to '{failed_filename}'", logging.WARNING)
         except OSError as e:
             if e.errno == 28:  # No space left on device
-                print(f"Vendor {vendor} - Cannot save failed downloads list due to disk space", flush=True)
+                print(f"⚠️  Cannot save failed downloads list due to disk space")
             else:
                 raise
 
@@ -625,20 +739,37 @@ def process_download(row, vendor, base_directory, failed_downloads):
 failed_downloads = []
 
 def main():
-    """Main function to process all vendors concurrently with immediate downloads."""
-    print(f"Starting processing for {len(vendors)} vendors", flush=True)
+    """Main function to process all vendors concurrently with immediate downloads and visual progress."""
+    global progress_tracker
+    
+    print("=" * 80)
+    print("🎯 LUXURY IMAGE DOWNLOADER - ENHANCED VERSION")
+    print("=" * 80)
+    print(f"📅 Date Range: {start_date} to {end_date}")
+    print(f"🏪 Total Vendors: {len(vendors)}")
+    print("=" * 80)
+    
     safe_log(f"Starting processing for {len(vendors)} vendors", logging.INFO)
     
     # Check initial disk space
     has_space, free_bytes = check_disk_space(os.getcwd(), 500*1024*1024)  # 500MB minimum
     if not has_space:
-        print(f"Warning: Low disk space detected. Available: {format_bytes(free_bytes)}")
+        print(f"⚠️  Warning: Low disk space detected. Available: {format_bytes(free_bytes)}")
         safe_log(f"Warning: Low disk space detected. Available: {format_bytes(free_bytes)}", logging.WARNING)
+    else:
+        print(f"💾 Disk Space: {format_bytes(free_bytes)} available")
+    
+    # Initialize progress tracker
+    progress_tracker = ProgressTracker(len(vendors))
     
     # Process vendors with a maximum of 3 concurrent operations (reduced to save disk space)
     max_concurrent_vendors = 3
     completed_data_processing = 0
     started_downloads = 0
+    
+    print(f"\n🚀 Starting data processing and downloads...")
+    print(f"⚙️  Concurrent vendors: {max_concurrent_vendors}")
+    print("-" * 80)
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_vendors) as executor:
         # Submit all vendor processing tasks
@@ -657,24 +788,81 @@ def main():
             try:
                 qualified_df = data_future.result()
                 if len(qualified_df) > 0:
+                    # Count total files for this vendor
+                    total_files = 0
+                    for index, row in qualified_df.iterrows():
+                        first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+                        if first_nine_images_str:
+                            image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+                            total_files += len(image_urls)
+                    
+                    # Update global progress tracker
+                    progress_tracker.total_files += total_files
+                    
                     # Start async download process for this vendor immediately
-                    # Downloads will run concurrently with other vendor processing
                     download_future = executor.submit(
                         lambda: asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
                     )
                     started_downloads += 1
-                    print(f"Vendor {vendor} - Data processing completed ({completed_data_processing}/{len(vendors)}), async downloads started immediately", flush=True)
+                    
+                    print(f"✅ Vendor {vendor} - Data processed ({completed_data_processing}/{len(vendors)}) | Files: {total_files} | Downloads started")
                     safe_log(f"Vendor {vendor} - Data processing completed, async downloads started immediately", logging.INFO)
                 else:
-                    print(f"Vendor {vendor} - No qualified data to download ({completed_data_processing}/{len(vendors)})", flush=True)
+                    print(f"⏭️  Vendor {vendor} - No qualified data ({completed_data_processing}/{len(vendors)})")
                     safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
             except Exception as e:
-                print(f"Vendor {vendor} - Error processing data: {e} ({completed_data_processing}/{len(vendors)})", flush=True)
+                print(f"❌ Vendor {vendor} - Error: {e} ({completed_data_processing}/{len(vendors)})")
                 safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
     
-    print(f"All vendor processing completed. Started async downloads for {started_downloads} vendors.", flush=True)
+    print("-" * 80)
+    print(f"🎉 All vendor processing completed!")
+    print(f"📊 Started downloads for {started_downloads} vendors")
+    print(f"📁 Total files to download: {progress_tracker.total_files}")
+    print("=" * 80)
+    
     safe_log(f"All vendor processing completed. Started async downloads for {started_downloads} vendors.", logging.INFO)
+
+def monitor_progress():
+    """Monitor and display overall progress in a separate thread."""
+    while True:
+        if progress_tracker:
+            vendor_pct, file_pct, elapsed, completed_files, failed_files = progress_tracker.get_overall_progress()
+            
+            # Only print if there's progress to show
+            if completed_files > 0 or failed_files > 0:
+                elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
+                print(f"\r📊 Overall Progress: Vendors {progress_tracker.completed_vendors}/{progress_tracker.total_vendors} ({vendor_pct:.1f}%) | "
+                      f"Files {completed_files}/{progress_tracker.total_files} ({file_pct:.1f}%) | "
+                      f"Failed: {failed_files} | Time: {elapsed_str}", end="", flush=True)
+            
+            # Stop monitoring if all vendors are completed
+            if progress_tracker.completed_vendors >= progress_tracker.total_vendors:
+                break
+        
+        time.sleep(2)  # Update every 2 seconds
 
 # Run the main process
 if __name__ == "__main__":
-    main()
+    # Start progress monitoring in a separate thread
+    monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+    monitor_thread.start()
+    
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Process interrupted by user")
+        print("🛑 Stopping downloads...")
+    except Exception as e:
+        print(f"\n\n❌ Unexpected error: {e}")
+        safe_log(f"Unexpected error in main: {e}", logging.ERROR)
+    finally:
+        print("\n" + "=" * 80)
+        print("🏁 Process completed!")
+        if progress_tracker:
+            vendor_pct, file_pct, elapsed, completed_files, failed_files = progress_tracker.get_overall_progress()
+            print(f"📈 Final Stats:")
+            print(f"   • Vendors: {progress_tracker.completed_vendors}/{progress_tracker.total_vendors}")
+            print(f"   • Files: {completed_files}/{progress_tracker.total_files}")
+            print(f"   • Failed: {failed_files}")
+            print(f"   • Time: {int(elapsed//60):02d}:{int(elapsed%60):02d}")
+        print("=" * 80)
