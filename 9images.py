@@ -280,8 +280,8 @@ def extract_data(data):
     for item in data['result']['items']:
         shop_name = item.get('shop_name', '')
         images = item.get('imgsSrc', [])
-        # Get only the first image instead of 9 images
-        first_image = images[0] if images else ''
+        # Get first 9 images instead of just the first one
+        first_nine_images = images[:9] if images else []
 
         title = item.get('title', '')
         tags = item.get('tags', [])
@@ -292,9 +292,10 @@ def extract_data(data):
 
         # === Create sanitized Image Name from first_image URL ===
         image_name = ''
-        if first_image:
+        if first_nine_images:
             try:
                 # Use the first image for naming
+                first_image = first_nine_images[0]
                 # Remove domain
                 path_match = re.sub(r'^https?://[^/]+/', '', first_image)
                 # Remove extension
@@ -313,7 +314,7 @@ def extract_data(data):
             'Shop Name': shop_name,
             'Images': ', '.join(images),
             'No of images': len(images),
-            'First Image': first_image,  # Store only the first image
+            'First Nine Images': ', '.join(first_nine_images),  # Store first 9 images
             'Image Name': image_name,  # ✅ Fully ready for file saving
             'Title': title,
             'Tag Name': tag_name,
@@ -358,15 +359,15 @@ def process_vendor_data(vendor, start_date, end_date):
         else:
             break  # Stop loop if API request fails
 
-    # Filter Data - Updated to check for First Image instead of First Nine Images
+    # Filter Data - Updated to check for First Nine Images instead of First Image
     if len(All_data) > 0:
         qualified_df = All_data[
-            (All_data['First Image'].notna()) &  # Ensure First Image is not empty
-            (All_data['First Image'] != '') &  # Ensure First Image is not an empty string
-            (All_data['No of images'] > 0)  # Ensure there is at least one image
+            (All_data['First Nine Images'].notna()) &  # Ensure First Nine Images is not empty
+            (All_data['First Nine Images'] != '') &  # Ensure First Nine Images is not an empty string
+            (All_data['No of images'] > 4)  # Ensure No of images is greater than 4
         ]
         
-        print(f"Vendor {vendor} - QUALIFIED RESULTS AFTER FILTER: {len(qualified_df)} (single images only)", flush=True)
+        print(f"Vendor {vendor} - QUALIFIED RESULTS AFTER FILTER: {len(qualified_df)} (first 9 images)", flush=True)
         return qualified_df
     else:
         print(f"Vendor {vendor} - No data to process.", flush=True)
@@ -595,8 +596,13 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
     if len(qualified_df) == 0:
         return
     
-    # Count total files to download (now just 1 per item)
-    total_files = len(qualified_df)  # One image per qualified item
+    # Count total files to download (9 images per qualified item)
+    total_files = 0
+    for index, row in qualified_df.iterrows():
+        first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+        if first_nine_images_str:
+            image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+            total_files += len(image_urls)
     
     if total_files == 0:
         print(f"Vendor {vendor} - No files to download", flush=True)
@@ -622,7 +628,7 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
             
             for index, row in qualified_df.iterrows():
                 good_id = str(row.get('Image Name', '')).strip()
-                first_image_url = str(row.get('First Image', '')).strip()
+                first_nine_images_str = str(row.get('First Nine Images', '')).strip()
                 tag_name = str(row.get('Tag Name', '')).strip()
 
                 if not tag_name:
@@ -636,15 +642,18 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
                 folder_path = os.path.join(vendor_folder, tag_name)
                 os.makedirs(folder_path, exist_ok=True)
 
-                # Download only the first image
-                if first_image_url:
-                    # Use Tag Name as prefix for file naming (no sequence number needed)
-                    file_prefix = tag_name.replace(' ', '_').replace(',', '_')
-                    file_name = f"{file_prefix}_{good_id}"
+                # Parse the comma-separated image URLs and create download tasks
+                if first_nine_images_str:
+                    image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
                     
-                    task = _worker(session, first_image_url, folder_path, file_name, 1, 
-                                 failed_downloads, tag_name, good_id, vendor, pbar)
-                    tasks.append(task)
+                    for sequence, img_url in enumerate(image_urls, 1):
+                        # Use Tag Name as prefix for file naming
+                        file_prefix = tag_name.replace(' ', '_').replace(',', '_')
+                        file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+                        
+                        task = _worker(session, img_url, folder_path, file_name, sequence, 
+                                     failed_downloads, tag_name, good_id, vendor, pbar)
+                        tasks.append(task)
             
             # Execute all download tasks with progress tracking
             if tasks:
@@ -691,7 +700,7 @@ def process_download(row, vendor, base_directory, failed_downloads):
     global failed_urls_set
 
     good_id = str(row.get('Image Name', '')).strip()
-    first_image_url = str(row.get('First Image', '')).strip()
+    first_nine_images_str = str(row.get('First Nine Images', '')).strip()
     tag_name = str(row.get('Tag Name', '')).strip()
 
     if not tag_name:
@@ -710,14 +719,17 @@ def process_download(row, vendor, base_directory, failed_downloads):
             failed_urls_set.add(url)
             failed_downloads.append([tag_name, good_id, url])
 
-    # Download only the first image
-    if first_image_url:
-        # Use Tag Name as prefix for file naming (no sequence number needed)
-        file_prefix = tag_name.replace(' ', '_').replace(',', '_')
-        file_name = f"{file_prefix}_{good_id}"
-        success, error = download_file(first_image_url, folder_path, file_name, 1)
-        if not success and error:
-            handle_failed_download(first_image_url)
+    # Parse the comma-separated image URLs and download each one
+    if first_nine_images_str:
+        image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+        
+        for sequence, img_url in enumerate(image_urls, 1):
+            # Use Tag Name as prefix for file naming
+            file_prefix = tag_name.replace(' ', '_').replace(',', '_')
+            file_name = f"{file_prefix}_{good_id}_{sequence:02d}"
+            success, error = download_file(img_url, folder_path, file_name, sequence)
+            if not success and error:
+                handle_failed_download(img_url)
 
 
     
@@ -774,8 +786,13 @@ def main():
             try:
                 qualified_df = data_future.result()
                 if len(qualified_df) > 0:
-                    # Count total files for this vendor (1 per qualified item)
-                    total_files = len(qualified_df)  # One image per qualified item
+                    # Count total files for this vendor (9 images per qualified item)
+                    total_files = 0
+                    for index, row in qualified_df.iterrows():
+                        first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+                        if first_nine_images_str:
+                            image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+                            total_files += len(image_urls)
                     
                     # Update global progress tracker
                     progress_tracker.total_files += total_files
