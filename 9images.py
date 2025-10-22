@@ -464,10 +464,10 @@ async def async_download_file(session, url, folder, file_name, sequence, vendor,
                                 await f.write(chunk)
                                 downloaded_size += len(chunk)
                                 
-                                # Update progress bar if available
+                                # Update progress bar if available (simplified description)
                                 if pbar and file_size > 0:
                                     progress_pct = (downloaded_size / file_size) * 100
-                                    pbar.set_description(f"📥 {vendor} - Downloading {file_name[:30]}... {progress_pct:.1f}%")
+                                    pbar.set_description(f"📥 {vendor} - {progress_pct:.1f}%")
                                 
                             except OSError as e:
                                 if e.errno == 28:  # No space left on device
@@ -495,14 +495,14 @@ async def async_download_file(session, url, folder, file_name, sequence, vendor,
                     attempt += 1
                     if attempt < retries:
                         if pbar:
-                            pbar.set_description(f"🔄 {vendor} - Retrying {file_name[:30]}... (Attempt {attempt})")
+                            pbar.set_description(f"🔄 {vendor} - Retrying... (Attempt {attempt})")
                         await asyncio.sleep(delay)
         except asyncio.TimeoutError:
             attempt += 1
             safe_log(f"Attempt {attempt}/{retries}: Timeout downloading {url}", logging.WARNING)
             if attempt < retries:
                 if pbar:
-                    pbar.set_description(f"⏰ {vendor} - Timeout, retrying {file_name[:30]}...")
+                    pbar.set_description(f"⏰ {vendor} - Timeout, retrying...")
                 await asyncio.sleep(delay)
         except OSError as e:
             if e.errno == 28:  # No space left on device
@@ -514,22 +514,22 @@ async def async_download_file(session, url, folder, file_name, sequence, vendor,
             else:
                 attempt += 1
                 safe_log(f"Attempt {attempt}/{retries}: Error downloading {url}. Error: {e}", logging.ERROR)
-                if attempt < retries:
-                    if pbar:
-                        pbar.set_description(f"🔄 {vendor} - Error, retrying {file_name[:30]}...")
-                    await asyncio.sleep(delay)
+            if attempt < retries:
+                if pbar:
+                    pbar.set_description(f"🔄 {vendor} - Error, retrying...")
+                await asyncio.sleep(delay)
         except Exception as e:
             attempt += 1
             safe_log(f"Attempt {attempt}/{retries}: Error downloading {url}. Error: {e}", logging.ERROR)
             if attempt < retries:
                 if pbar:
-                    pbar.set_description(f"🔄 {vendor} - Error, retrying {file_name[:30]}...")
+                    pbar.set_description(f"🔄 {vendor} - Error, retrying...")
                 await asyncio.sleep(delay)
     
     # After retries failed
     safe_log(f"Max retries reached. Failed to download: {url}", logging.ERROR)
     if pbar:
-        pbar.set_description(f"❌ {vendor} - Failed {file_name[:30]} after {retries} attempts")
+        pbar.set_description(f"❌ {vendor} - Failed after {retries} attempts")
     return False, f"Max retries reached for {url}"
 
 def download_file(url, folder, file_name, sequence, retries=4, delay=15):
@@ -602,8 +602,7 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
         print(f"Vendor {vendor} - No files to download", flush=True)
         return
     
-    print(f"\n🚀 Starting downloads for vendor: {vendor}")
-    print(f"📊 Items: {len(qualified_df)}, Files: {total_files} (1 image per item)")
+    print(f"\n🚀 Starting downloads for vendor: {vendor} ({total_files} files)")
     safe_log(f"Starting async downloads for vendor: {vendor} ({len(qualified_df)} items, {total_files} files)", logging.INFO)
     
     completed = 0
@@ -613,9 +612,10 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
     connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
     timeout = aiohttp.ClientTimeout(total=60)
     
-    # Create progress bar for this vendor
+    # Create progress bar for this vendor (cleaner format)
     with tqdm(total=total_files, desc=f"📥 {vendor}", unit="file", 
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} files [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+              leave=False) as pbar:
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             tasks = []
@@ -667,12 +667,10 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
     if progress_tracker:
         progress_tracker.complete_vendor(vendor)
     
-    # Print completion summary
+    # Print completion summary (simplified)
     success_rate = (completed / total_files * 100) if total_files > 0 else 0
-    print(f"\n✅ Vendor {vendor} completed!")
-    print(f"📈 Success: {completed}/{total_files} files ({success_rate:.1f}%)")
-    if failed_downloads:
-        print(f"❌ Failed: {len(failed_downloads)} files")
+    print(f"✅ {vendor}: {completed}/{total_files} ({success_rate:.1f}%)" + 
+          (f" | Failed: {len(failed_downloads)}" if failed_downloads else ""))
     
     safe_log(f"Vendor {vendor} - Downloads completed ({completed}/{total_files} files, {success_rate:.1f}% success)", logging.INFO)
     
@@ -788,19 +786,16 @@ def main():
                     )
                     started_downloads += 1
                     
-                    print(f"✅ Vendor {vendor} - Data processed ({completed_data_processing}/{len(vendors)}) | Files: {total_files} | Downloads started")
+                    print(f"✅ {vendor}: {total_files} files queued")
                     safe_log(f"Vendor {vendor} - Data processing completed, async downloads started immediately", logging.INFO)
                 else:
-                    print(f"⏭️  Vendor {vendor} - No qualified data ({completed_data_processing}/{len(vendors)})")
+                    print(f"⏭️  {vendor}: No data")
                     safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
             except Exception as e:
-                print(f"❌ Vendor {vendor} - Error: {e} ({completed_data_processing}/{len(vendors)})")
+                print(f"❌ {vendor}: Error - {e}")
                 safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
     
-    print("-" * 80)
-    print(f"🎉 All vendor processing completed!")
-    print(f"📊 Started downloads for {started_downloads} vendors")
-    print(f"📁 Total files to download: {progress_tracker.total_files}")
+    print(f"\n🎉 Processing complete! {started_downloads} vendors, {progress_tracker.total_files} files")
     print("=" * 80)
     
     safe_log(f"All vendor processing completed. Started async downloads for {started_downloads} vendors.", logging.INFO)
@@ -814,15 +809,15 @@ def monitor_progress():
             # Only print if there's progress to show
             if completed_files > 0 or failed_files > 0:
                 elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
-                print(f"\r📊 Overall Progress: Vendors {progress_tracker.completed_vendors}/{progress_tracker.total_vendors} ({vendor_pct:.1f}%) | "
-                      f"Files {completed_files}/{progress_tracker.total_files} ({file_pct:.1f}%) | "
-                      f"Failed: {failed_files} | Time: {elapsed_str}", end="", flush=True)
+                print(f"\r📊 Progress: {progress_tracker.completed_vendors}/{progress_tracker.total_vendors} vendors | "
+                      f"{completed_files}/{progress_tracker.total_files} files ({file_pct:.1f}%) | "
+                      f"Time: {elapsed_str}", end="", flush=True)
             
             # Stop monitoring if all vendors are completed
             if progress_tracker.completed_vendors >= progress_tracker.total_vendors:
                 break
         
-        time.sleep(2)  # Update every 2 seconds
+        time.sleep(3)  # Update every 3 seconds
 
 # Run the main process
 if __name__ == "__main__":
