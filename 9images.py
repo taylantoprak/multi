@@ -674,7 +674,7 @@ async def process_vendor_downloads_async(vendor, qualified_df, base_directory):
     
     # Mark vendor as completed
     if progress_tracker:
-        progress_tracker.complete_vendor(vendor)
+        progress_tracker.completed_vendors += 1
     
     # Print completion summary (simplified)
     success_rate = (completed / total_files * 100) if total_files > 0 else 0
@@ -737,7 +737,7 @@ def process_download(row, vendor, base_directory, failed_downloads):
 failed_downloads = []
 
 def main():
-    """Main function to process all vendors concurrently with immediate downloads and visual progress."""
+    """Main function to process all vendors with proper sequential processing to avoid loops."""
     global progress_tracker
     
     print("=" * 80)
@@ -760,62 +760,56 @@ def main():
     # Initialize progress tracker
     progress_tracker = ProgressTracker(len(vendors))
     
-    # Process vendors with a maximum of 3 concurrent operations (reduced to save disk space)
-    max_concurrent_vendors = 3
-    completed_data_processing = 0
-    started_downloads = 0
-    
-    print(f"\n🚀 Starting data processing and downloads...")
-    print(f"⚙️  Concurrent vendors: {max_concurrent_vendors}")
+    print(f"\n🚀 Starting sequential processing...")
+    print(f"⚙️  Processing vendors one by one to avoid loops")
     print("-" * 80)
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_vendors) as executor:
-        # Submit all vendor processing tasks
-        future_to_vendor = {}
-        
-        for vendor in vendors:
-            # First, process data for the vendor
-            data_future = executor.submit(process_vendor_data, vendor, start_date, end_date)
-            future_to_vendor[data_future] = vendor
-        
-        # Process completed data futures and start downloads immediately
-        for data_future in concurrent.futures.as_completed(future_to_vendor):
-            vendor = future_to_vendor[data_future]
-            completed_data_processing += 1
-            
-            try:
-                qualified_df = data_future.result()
-                if len(qualified_df) > 0:
-                    # Count total files for this vendor (9 images per qualified item)
-                    total_files = 0
-                    for index, row in qualified_df.iterrows():
-                        first_nine_images_str = str(row.get('First Nine Images', '')).strip()
-                        if first_nine_images_str:
-                            image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
-                            total_files += len(image_urls)
-                    
-                    # Update global progress tracker
-                    progress_tracker.total_files += total_files
-                    
-                    # Start async download process for this vendor immediately
-                    download_future = executor.submit(
-                        lambda: asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
-                    )
-                    started_downloads += 1
-                    
-                    print(f"✅ {vendor}: {total_files} files queued")
-                    safe_log(f"Vendor {vendor} - Data processing completed, async downloads started immediately", logging.INFO)
-                else:
-                    print(f"⏭️  {vendor}: No data")
-                    safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
-            except Exception as e:
-                print(f"❌ {vendor}: Error - {e}")
-                safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
+    completed_vendors = 0
+    total_files_processed = 0
     
-    print(f"\n🎉 Processing complete! {started_downloads} vendors, {progress_tracker.total_files} files")
+    # Process vendors sequentially to avoid concurrent issues
+    for i, vendor in enumerate(vendors, 1):
+        print(f"\n📊 Processing vendor {i}/{len(vendors)}: {vendor}")
+        
+        try:
+            # Process data for the vendor
+            qualified_df = process_vendor_data(vendor, start_date, end_date)
+            
+            if len(qualified_df) > 0:
+                # Count total files for this vendor
+                total_files = 0
+                for index, row in qualified_df.iterrows():
+                    first_nine_images_str = str(row.get('First Nine Images', '')).strip()
+                    if first_nine_images_str:
+                        image_urls = [url.strip() for url in first_nine_images_str.split(',') if url.strip()]
+                        total_files += len(image_urls)
+                
+                # Update global progress tracker
+                progress_tracker.total_files += total_files
+                total_files_processed += total_files
+                
+                print(f"✅ {vendor}: {total_files} files queued")
+                
+                # Start async download process for this vendor
+                try:
+                    asyncio.run(process_vendor_downloads_async(vendor, qualified_df, os.getcwd()))
+                    completed_vendors += 1
+                    print(f"✅ {vendor}: Download completed")
+                except Exception as e:
+                    print(f"❌ {vendor}: Download error - {e}")
+                    safe_log(f"Vendor {vendor} - Download error: {e}", logging.ERROR)
+            else:
+                print(f"⏭️  {vendor}: No data")
+                safe_log(f"Vendor {vendor} - No qualified data to download", logging.INFO)
+                
+        except Exception as e:
+            print(f"❌ {vendor}: Processing error - {e}")
+            safe_log(f"Vendor {vendor} - Error processing data: {e}", logging.ERROR)
+    
+    print(f"\n🎉 Processing complete! {completed_vendors} vendors, {total_files_processed} files")
     print("=" * 80)
     
-    safe_log(f"All vendor processing completed. Started async downloads for {started_downloads} vendors.", logging.INFO)
+    safe_log(f"All vendor processing completed. Processed {completed_vendors} vendors with {total_files_processed} files.", logging.INFO)
 
 def monitor_progress():
     """Monitor and display overall progress in a separate thread."""
@@ -838,10 +832,6 @@ def monitor_progress():
 
 # Run the main process
 if __name__ == "__main__":
-    # Start progress monitoring in a separate thread
-    monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
-    monitor_thread.start()
-    
     try:
         main()
     except KeyboardInterrupt:
